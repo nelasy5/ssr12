@@ -144,8 +144,8 @@ async function subscribeAddress(address) {
   // 1) Пытаемся подписаться напрямую на PublicKey (рекомендуемый способ)
   try {
     const subId = connection.onLogs(pk, async (logInfo) => {
-      await handleSignature(logInfo.signature, [pk]);
-    }, 'confirmed');
+      enqueueTx(logInfo.signature, [pk]);
+    }, 'finalized');
     subscriptions.set(address, subId);
     console.log(`[sol] subscribed (pk) ${address} (id=${subId})`);
     return;
@@ -156,8 +156,8 @@ async function subscribeAddress(address) {
   // 2) Фолбэк: если вдруг провалится (редко) — пробуем mentions со строкой
   try {
     const subId = connection.onLogs({ mentions: [pk.toBase58()] }, async (logInfo) => {
-      await handleSignature(logInfo.signature, [pk]);
-    }, 'confirmed');
+      enqueueTx(logInfo.signature, [pk]);
+    }, 'finalized'');
     subscriptions.set(address, subId);
     console.log(`[sol] subscribed (mentions) ${address} (id=${subId})`);
   } catch (e) {
@@ -180,6 +180,75 @@ async function bootstrap() {
   for (const a of base) await subscribeAddress(a);
 }
 bootstrap().catch(console.error);
+
+// === Rate limit & queue ===
+const RATE_MAX_PER_SEC = Number(process.env.SOL_RATE_MAX_PER_SEC || 6); // сколько детальных запросов в сек
+const RATE_CONCURRENCY = Number(process.envS_SOL_RATE_CONCURRENCY || 2); // параллельных
+const _q = [];
+const _inflight = new Set();
+let _lastTick = 0;
+
+function enqueueTx(signature, mentionPubkeys) {
+  // если уже в работе — просто дополним mentions
+  const existing = _q.find(i => i.signature === signature) || [..._inflight].find(i => i.signature === signature);
+  if (existing) {
+    // мерджим pubkeys
+    const set = new Set(existing.mentions.map(p => p.toBase58()));
+    for (const p of mentionPubkeys) set.add(p.toBase58());
+    existing.mentions = [...set].map(s => new PublicKey(s));
+    return;
+  }
+  _q.push({ signature, mentions: mentionPubkeys, tries: 0, nextAt: 0 });
+}
+
+async function processQueue(now = Date.now()) {
+  // ограничим частоту запросов
+  const perTick = Math.max(1, Math.floor(RATE_MAX_PER_SEC / 4)); // 4 тика в сек
+  if (now - _lastTick < 250) return; // ~4 тика/сек
+  _lastTick = now;
+
+  // сколько можем запустить прямо сейчас
+  let slots = Math.max(0, RATE_CONCURRENCY - _inflight.size);
+  if (!slots) return;
+
+  let launched = 0;
+  for (let i = 0; i < _q.length && launched < Math.min(perTick, slots); i++) {
+    const item = _q[i];
+    if (item.nextAt > now) continue;
+
+    _q.splice(i, 1); i--;
+    _inflight.add(item);
+
+    // запускаем
+    fetchAndNotify(item)
+      .catch(e => console.error('[sol] fetch error:', e?.message || e))
+      .finally(() => _inflight.delete(item));
+
+    launched++;
+  }
+}
+setInterval(processQueue, 60); // частый таймер, но работа по 250мс-шагам
+
+async function fetchAndNotify(item) {
+  const { signature, mentions } = item;
+  try {
+    await handleSignature(signature, mentions);
+  } catch (e) {
+    // если 429 — бэк‑офф и обратно в очередь
+    const msg = String(e?.message || '');
+    const is429 = msg.includes('429') || msg.includes('Too Many Requests');
+    if (is429 && item.tries < 6) {
+      item.tries++;
+      const delay = Math.min(8000, 500 * 2 ** (item.tries - 1)); // 0.5s → 8s
+      item.nextAt = Date.now() + delay + Math.floor(Math.random() * 200); // джиттер
+      _q.push(item);
+      console.warn(`[sol] 429, retry #${item.tries} in ${delay}ms for ${signature}`);
+      return;
+    }
+    throw e;
+  }
+}
+
 
 // ====== TX handler ======
 async function handleSignature(signature, mentionPubkeys) {
