@@ -140,11 +140,29 @@ const subscriptions = new Map(); // address -> subId
 async function subscribeAddress(address) {
   if (subscriptions.has(address)) return;
   const pk = new PublicKey(address);
-  const subId = connection.onLogs({ mentions: [pk.toBase58()] }, async (logInfo) => {
-    await handleSignature(logInfo.signature, [pk]);
-  }, 'confirmed');
-  subscriptions.set(address, subId);
-  console.log(`[sol] subscribed ${address} (id=${subId})`);
+
+  // 1) Пытаемся подписаться напрямую на PublicKey (рекомендуемый способ)
+  try {
+    const subId = connection.onLogs(pk, async (logInfo) => {
+      await handleSignature(logInfo.signature, [pk]);
+    }, 'confirmed');
+    subscriptions.set(address, subId);
+    console.log(`[sol] subscribed (pk) ${address} (id=${subId})`);
+    return;
+  } catch (e) {
+    console.warn(`[sol] onLogs(pk) failed for ${address}:`, e?.message || e);
+  }
+
+  // 2) Фолбэк: если вдруг провалится (редко) — пробуем mentions со строкой
+  try {
+    const subId = connection.onLogs({ mentions: [pk.toBase58()] }, async (logInfo) => {
+      await handleSignature(logInfo.signature, [pk]);
+    }, 'confirmed');
+    subscriptions.set(address, subId);
+    console.log(`[sol] subscribed (mentions) ${address} (id=${subId})`);
+  } catch (e) {
+    console.error(`[sol] both onLogs methods failed for ${address}:`, e?.message || e);
+  }
 }
 async function unsubscribeAddress(address) {
   const subId = subscriptions.get(address);
