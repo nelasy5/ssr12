@@ -141,11 +141,15 @@ async function subscribeAddress(address) {
   if (subscriptions.has(address)) return;
   const pk = new PublicKey(address);
 
-  // 1) Пытаемся подписаться напрямую на PublicKey (рекомендуемый способ)
+  // 1) Основной способ: фильтр по PublicKey
   try {
-    const subId = connection.onLogs(pk, async (logInfo) => {
-      enqueueTx(logInfo.signature, [pk]);
-    }, 'finalized');
+    const subId = connection.onLogs(
+      pk,
+      (logInfo) => {
+        enqueueTx(logInfo.signature, [pk]);
+      },
+      'finalized'
+    );
     subscriptions.set(address, subId);
     console.log(`[sol] subscribed (pk) ${address} (id=${subId})`);
     return;
@@ -153,17 +157,22 @@ async function subscribeAddress(address) {
     console.warn(`[sol] onLogs(pk) failed for ${address}:`, e?.message || e);
   }
 
-  // 2) Фолбэк: если вдруг провалится (редко) — пробуем mentions со строкой
+  // 2) Фолбэк: mentions (может не поддерживаться некоторыми RPC)
   try {
-    const subId = connection.onLogs({ mentions: [pk.toBase58()] }, async (logInfo) => {
-      enqueueTx(logInfo.signature, [pk]);
-    }, 'finalized'');
+    const subId = connection.onLogs(
+      { mentions: [pk.toBase58()] },
+      (logInfo) => {
+        enqueueTx(logInfo.signature, [pk]);
+      },
+      'finalized'
+    );
     subscriptions.set(address, subId);
     console.log(`[sol] subscribed (mentions) ${address} (id=${subId})`);
   } catch (e) {
     console.error(`[sol] both onLogs methods failed for ${address}:`, e?.message || e);
   }
 }
+
 async function unsubscribeAddress(address) {
   const subId = subscriptions.get(address);
   if (subId != null) {
@@ -182,32 +191,51 @@ async function bootstrap() {
 bootstrap().catch(console.error);
 
 // === Rate limit & queue ===
-const RATE_MAX_PER_SEC = Number(process.env.SOL_RATE_MAX_PER_SEC || 6); // сколько детальных запросов в сек
-const RATE_CONCURRENCY = Number(process.envS_SOL_RATE_CONCURRENCY || 2); // параллельных
+// === Rate limit & queue ===
+const RATE_MAX_PER_SEC = Number(process.env.SOL_RATE_MAX_PER_SEC || 6); // детальных запросов/сек
+const RATE_CONCURRENCY = Number(process.env.SOL_RATE_CONCURRENCY || 2); // параллельных запросов
+
 const _q = [];
 const _inflight = new Set();
 let _lastTick = 0;
 
 function enqueueTx(signature, mentionPubkeys) {
-  // если уже в работе — просто дополним mentions
-  const existing = _q.find(i => i.signature === signature) || [..._inflight].find(i => i.signature === signature);
-  if (existing) {
-    // мерджим pubkeys
-    const set = new Set(existing.mentions.map(p => p.toBase58()));
+  // если уже в работе — дополним mentions
+  const exists = _q.find(i => i.signature === signature) || [..._inflight].find(i => i.signature === signature);
+  if (exists) {
+    const set = new Set(exists.mentions.map(p => p.toBase58()));
     for (const p of mentionPubkeys) set.add(p.toBase58());
-    existing.mentions = [...set].map(s => new PublicKey(s));
+    exists.mentions = [...set].map(s => new PublicKey(s));
     return;
   }
   _q.push({ signature, mentions: mentionPubkeys, tries: 0, nextAt: 0 });
 }
 
-async function processQueue(now = Date.now()) {
-  // ограничим частоту запросов
-  const perTick = Math.max(1, Math.floor(RATE_MAX_PER_SEC / 4)); // 4 тика в сек
+async function fetchAndNotify(item) {
+  const { signature, mentions } = item;
+  try {
+    await handleSignature(signature, mentions);
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const is429 = msg.includes('429') || msg.includes('Too Many Requests');
+    if (is429 && item.tries < 6) {
+      item.tries++;
+      const delay = Math.min(8000, 500 * 2 ** (item.tries - 1)); // 0.5s → 8s
+      item.nextAt = Date.now() + delay + Math.floor(Math.random() * 200);
+      _q.push(item);
+      console.warn(`[sol] 429, retry #${item.tries} in ${delay}ms for ${signature}`);
+      return;
+    }
+    throw e;
+  }
+}
+
+function processQueue() {
+  const now = Date.now();
   if (now - _lastTick < 250) return; // ~4 тика/сек
   _lastTick = now;
 
-  // сколько можем запустить прямо сейчас
+  const perTick = Math.max(1, Math.floor(RATE_MAX_PER_SEC / 4));
   let slots = Math.max(0, RATE_CONCURRENCY - _inflight.size);
   if (!slots) return;
 
@@ -218,16 +246,12 @@ async function processQueue(now = Date.now()) {
 
     _q.splice(i, 1); i--;
     _inflight.add(item);
-
-    // запускаем
-    fetchAndNotify(item)
-      .catch(e => console.error('[sol] fetch error:', e?.message || e))
-      .finally(() => _inflight.delete(item));
-
+    fetchAndNotify(item).finally(() => _inflight.delete(item));
     launched++;
   }
 }
-setInterval(processQueue, 60); // частый таймер, но работа по 250мс-шагам
+setInterval(processQueue, 60);
+ // частый таймер, но работа по 250мс-шагам
 
 async function fetchAndNotify(item) {
   const { signature, mentions } = item;
