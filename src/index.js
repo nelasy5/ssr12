@@ -312,5 +312,15 @@ bot.onText(/^\/remove(?:\s+(.+))?$/i, async (msg, match) => {
   );
 });
 
+bot.onText(/^\/redis$/, async (msg) => {
+  if (!redis) return bot.sendMessage(msg.chat.id, 'Redis: отключён (нет конфигурации).');
+  try {
+    const pong = await redis.ping();
+    await bot.sendMessage(msg.chat.id, `Redis OK: ${pong}`);
+  } catch (e) {
+    await bot.sendMessage(msg.chat.id, `Redis error: ${e?.message || e}`);
+  }
+});
+
 // ====== HEARTBEAT ======
 setInterval(() => console.log(`[heartbeat] ${new Date().toISOString()}`), 60_000);
