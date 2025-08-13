@@ -2,11 +2,11 @@
   "name": "solana-tx-telegram-bot",
   "version": "1.1.0",
   "description": "Telegram bot that watches Solana transactions and posts to a channel",
-  "main": "src/index.js",
+  "main": "src/echo.js",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "NODE_ENV=development nodemon src/index.js"
+    "start": "node src/echo.js",
+    "dev": "NODE_ENV=development nodemon src/echo.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.3",
@@ -17,9 +17,4 @@
   "devDependencies": {
     "nodemon": "^3.1.0"
   }
-
-"scripts": {
-  "start": "node src/echo.js"
-}
-
 }
