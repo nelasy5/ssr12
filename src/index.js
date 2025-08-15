@@ -16,7 +16,7 @@ const ADMIN_CHAT_IDS = (process.env.ALLOWED_USER_IDS || '').split(',').map(s=>s.
 
 if (!BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required');
 if (!CHANNEL_ID) {
-  console.warn('[warn] TELEGRAM_CHANNEL_ID не задан — уведомления о транзакциях в канал отправляться не будут, но команды доступны.');
+  console.warn('[warn] TELEGRAM_CHANNEL_ID не задан — в канал слать не будем, но команды доступны.');
 }
 
 // ====== TELEGRAM (polling) ======
@@ -24,8 +24,7 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 (async () => {
   try {
-    // гарантированно выключим вебхук, чтобы polling работал
-    await bot.deleteWebHook({ drop_pending_updates: true });
+    await bot.deleteWebHook({ drop_pending_updates: true }); // выключим вебхук
     const me = await bot.getMe();
     console.log('[tg] bot online as @' + me.username);
   } catch (e) {
@@ -38,22 +37,19 @@ bot.onText(/^\/start$/, (m) => bot.sendMessage(m.chat.id, 'Я на связи. �
 bot.onText(/^\/ping$/,  (m) => bot.sendMessage(m.chat.id, 'pong'));
 bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
 
-// ====== REDIS (авто TLS, private/public URL, нормальные логи) ======
+// ====== REDIS (авто TLS / public / private) ======
 function makeRedis() {
   const url = process.env.REDIS_URL;
-  const optsCommon = {
+  const opts = {
     lazyConnect: true,
     maxRetriesPerRequest: null,
     enableReadyCheck: true,
     reconnectOnError: () => true
   };
-
   if (url) {
     const useTLS = url.startsWith('rediss://');
-    return new Redis(url, { ...optsCommon, tls: useTLS ? {} : undefined });
+    return new Redis(url, { ...opts, tls: useTLS ? {} : undefined });
   }
-
-  // фолбэк: раздельные переменные
   const host = process.env.REDIS_HOST;
   const port = Number(process.env.REDIS_PORT || 6379);
   const password = process.env.REDIS_PASSWORD || undefined;
@@ -62,7 +58,7 @@ function makeRedis() {
     console.warn('[redis] REDIS_URL/REDIS_HOST не заданы — персистентность отключена.');
     return null;
   }
-  return new Redis({ host, port, password, tls: useTLS ? {} : undefined, ...optsCommon });
+  return new Redis({ host, port, password, tls: useTLS ? {} : undefined, ...opts });
 }
 const redis = makeRedis();
 if (redis) {
@@ -135,18 +131,80 @@ async function ensureSeeded() {
   }
 }
 
+// ====== SOL: rate-limit & queue (уникальные имена) ======
+const SOL_RATE_MAX_PER_SEC = Number(process.env.SOL_RATE_MAX_PER_SEC || 6);  // детальных запросов/сек
+const SOL_RATE_CONCURRENCY = Number(process.env.SOL_RATE_CONCURRENCY || 2);  // параллельных
+
+const solQueue = [];
+const solInflight = new Set();
+let solLastTick = 0;
+
+function enqueueSolTx(signature, mentionPubkeys) {
+  const exists =
+    solQueue.find(i => i.signature === signature) ||
+    [...solInflight].find(i => i.signature === signature);
+  if (exists) {
+    const set = new Set(exists.mentions.map(p => p.toBase58()));
+    for (const p of mentionPubkeys) set.add(p.toBase58());
+    exists.mentions = [...set].map(s => new PublicKey(s));
+    return;
+  }
+  solQueue.push({ signature, mentions: mentionPubkeys, tries: 0, nextAt: 0 });
+}
+
+async function fetchAndNotifySol(item) {
+  const { signature, mentions } = item;
+  try {
+    await handleSignature(signature, mentions);
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const is429 = msg.includes('429') || msg.includes('Too Many Requests');
+    if (is429 && item.tries < 6) {
+      item.tries++;
+      const delay = Math.min(8000, 500 * 2 ** (item.tries - 1)); // 0.5s → 8s
+      item.nextAt = Date.now() + delay + Math.floor(Math.random() * 200);
+      solQueue.push(item);
+      console.warn(`[sol] 429, retry #${item.tries} in ${delay}ms for ${signature}`);
+      return;
+    }
+    throw e;
+  }
+}
+
+function processSolQueue() {
+  const now = Date.now();
+  if (now - solLastTick < 250) return; // ~4 тика/сек
+  solLastTick = now;
+
+  const perTick = Math.max(1, Math.floor(SOL_RATE_MAX_PER_SEC / 4));
+  let slots = Math.max(0, SOL_RATE_CONCURRENCY - solInflight.size);
+  if (!slots) return;
+
+  let launched = 0;
+  for (let i = 0; i < solQueue.length && launched < Math.min(perTick, slots); i++) {
+    const item = solQueue[i];
+    if (item.nextAt > now) continue;
+
+    solQueue.splice(i, 1); i--;
+    solInflight.add(item);
+    fetchAndNotifySol(item).finally(() => solInflight.delete(item));
+    launched++;
+  }
+}
+setInterval(processSolQueue, 60);
+
 // ====== Subscriptions ======
 const subscriptions = new Map(); // address -> subId
 async function subscribeAddress(address) {
   if (subscriptions.has(address)) return;
   const pk = new PublicKey(address);
 
-  // 1) Основной способ: фильтр по PublicKey
+  // основной способ: фильтр по PublicKey (шире поддерживается)
   try {
     const subId = connection.onLogs(
       pk,
       (logInfo) => {
-        enqueueTx(logInfo.signature, [pk]);
+        enqueueSolTx(logInfo.signature, [pk]);
       },
       'finalized'
     );
@@ -157,12 +215,12 @@ async function subscribeAddress(address) {
     console.warn(`[sol] onLogs(pk) failed for ${address}:`, e?.message || e);
   }
 
-  // 2) Фолбэк: mentions (может не поддерживаться некоторыми RPC)
+  // фолбэк: mentions
   try {
     const subId = connection.onLogs(
       { mentions: [pk.toBase58()] },
       (logInfo) => {
-        enqueueTx(logInfo.signature, [pk]);
+        enqueueSolTx(logInfo.signature, [pk]);
       },
       'finalized'
     );
@@ -182,6 +240,7 @@ async function unsubscribeAddress(address) {
     console.log(`[sol] unsubscribed ${address}`);
   }
 }
+
 async function bootstrap() {
   await ensureSeeded();
   const list = (await getWatchedAddresses()).filter(isValidPubkey);
@@ -190,142 +249,54 @@ async function bootstrap() {
 }
 bootstrap().catch(console.error);
 
-// === Rate limit & queue ===
-// === Rate limit & queue ===
-const RATE_MAX_PER_SEC = Number(process.env.SOL_RATE_MAX_PER_SEC || 6); // детальных запросов/сек
-const RATE_CONCURRENCY = Number(process.env.SOL_RATE_CONCURRENCY || 2); // параллельных запросов
-
-const _q = [];
-const _inflight = new Set();
-let _lastTick = 0;
-
-function enqueueTx(signature, mentionPubkeys) {
-  // если уже в работе — дополним mentions
-  const exists = _q.find(i => i.signature === signature) || [..._inflight].find(i => i.signature === signature);
-  if (exists) {
-    const set = new Set(exists.mentions.map(p => p.toBase58()));
-    for (const p of mentionPubkeys) set.add(p.toBase58());
-    exists.mentions = [...set].map(s => new PublicKey(s));
-    return;
-  }
-  _q.push({ signature, mentions: mentionPubkeys, tries: 0, nextAt: 0 });
-}
-
-async function fetchAndNotify(item) {
-  const { signature, mentions } = item;
-  try {
-    await handleSignature(signature, mentions);
-  } catch (e) {
-    const msg = String(e?.message || '');
-    const is429 = msg.includes('429') || msg.includes('Too Many Requests');
-    if (is429 && item.tries < 6) {
-      item.tries++;
-      const delay = Math.min(8000, 500 * 2 ** (item.tries - 1)); // 0.5s → 8s
-      item.nextAt = Date.now() + delay + Math.floor(Math.random() * 200);
-      _q.push(item);
-      console.warn(`[sol] 429, retry #${item.tries} in ${delay}ms for ${signature}`);
-      return;
-    }
-    throw e;
-  }
-}
-
-function processQueue() {
-  const now = Date.now();
-  if (now - _lastTick < 250) return; // ~4 тика/сек
-  _lastTick = now;
-
-  const perTick = Math.max(1, Math.floor(RATE_MAX_PER_SEC / 4));
-  let slots = Math.max(0, RATE_CONCURRENCY - _inflight.size);
-  if (!slots) return;
-
-  let launched = 0;
-  for (let i = 0; i < _q.length && launched < Math.min(perTick, slots); i++) {
-    const item = _q[i];
-    if (item.nextAt > now) continue;
-
-    _q.splice(i, 1); i--;
-    _inflight.add(item);
-    fetchAndNotify(item).finally(() => _inflight.delete(item));
-    launched++;
-  }
-}
-setInterval(processQueue, 60);
- // частый таймер, но работа по 250мс-шагам
-
-async function fetchAndNotify(item) {
-  const { signature, mentions } = item;
-  try {
-    await handleSignature(signature, mentions);
-  } catch (e) {
-    // если 429 — бэк‑офф и обратно в очередь
-    const msg = String(e?.message || '');
-    const is429 = msg.includes('429') || msg.includes('Too Many Requests');
-    if (is429 && item.tries < 6) {
-      item.tries++;
-      const delay = Math.min(8000, 500 * 2 ** (item.tries - 1)); // 0.5s → 8s
-      item.nextAt = Date.now() + delay + Math.floor(Math.random() * 200); // джиттер
-      _q.push(item);
-      console.warn(`[sol] 429, retry #${item.tries} in ${delay}ms for ${signature}`);
-      return;
-    }
-    throw e;
-  }
-}
-
-
 // ====== TX handler ======
 async function handleSignature(signature, mentionPubkeys) {
   if (seenSignatures.has(signature)) return;
   rememberSig(signature);
 
-  try {
-    const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx) return;
-    const { meta, blockTime, transaction } = tx;
-    const feeLamports = meta?.fee ?? 0;
-    const ts = blockTime ? new Date(blockTime * 1000).toISOString() : 'unknown time';
+  const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+  if (!tx) return;
+  const { meta, blockTime, transaction } = tx;
+  const feeLamports = meta?.fee ?? 0;
+  const ts = blockTime ? new Date(blockTime * 1000).toISOString() : 'unknown time';
 
-    const pre = meta?.preBalances || [];
-    const post = meta?.postBalances || [];
-    const accounts = transaction.message.accountKeys.map(k => k.pubkey?.toBase58?.() || k.toBase58());
+  const pre = meta?.preBalances || [];
+  const post = meta?.postBalances || [];
+  const accounts = transaction.message.accountKeys.map(k => k.pubkey?.toBase58?.() || k.toBase58());
 
-    const deltas = [];
-    for (const watched of mentionPubkeys) {
-      const idx = accounts.findIndex(a => a === watched.toBase58());
-      if (idx >= 0 && pre[idx] != null && post[idx] != null) {
-        const delta = post[idx] - pre[idx];
-        if (delta !== 0) deltas.push({ address: watched.toBase58(), deltaLamports: delta });
-      }
+  const deltas = [];
+  for (const watched of mentionPubkeys) {
+    const idx = accounts.findIndex(a => a === watched.toBase58());
+    if (idx >= 0 && pre[idx] != null && post[idx] != null) {
+      const delta = post[idx] - pre[idx];
+      if (delta !== 0) deltas.push({ address: watched.toBase58(), deltaLamports: delta });
     }
+  }
 
-    const parts = [];
-    parts.push('🟣 Новая транзакция в Solana');
-    parts.push(`⏱️ Время: ${ts}`);
-    parts.push(`💳 Подпись: <a href="${txLink(signature)}">${signature.slice(0,8)}…${signature.slice(-6)}</a>`);
-    parts.push(`💸 Комиссия: ${lamportsToSOL(feeLamports)} SOL`);
+  const parts = [];
+  parts.push('🟣 Новая транзакция в Solana');
+  parts.push(`⏱️ Время: ${ts}`);
+  parts.push(`💳 Подпись: <a href="${txLink(signature)}">${signature.slice(0,8)}…${signature.slice(-6)}</a>`);
+  parts.push(`💸 Комиссия: ${lamportsToSOL(feeLamports)} SOL`);
 
-    if (deltas.length) {
-      parts.push('\n📈 Изменения баланса (отслеживаемые):');
-      for (const d of deltas) {
-        const sign = d.deltaLamports > 0 ? '+' : '';
-        parts.push(`• <a href="${addrLink(d.address)}">${d.address.slice(0,4)}…${d.address.slice(-4)}</a>: ${sign}${lamportsToSOL(d.deltaLamports)} SOL`);
-      }
-    } else {
-      parts.push('\nℹ️ Адрес(а) упомянут(ы) в транзакции (возможно SPL):');
-      for (const m of mentionPubkeys) {
-        const a = m.toBase58();
-        parts.push(`• <a href="${addrLink(a)}">${a.slice(0,4)}…${a.slice(-4)}</a>`);
-      }
+  if (deltas.length) {
+    parts.push('\n📈 Изменения баланса (отслеживаемые):');
+    for (const d of deltas) {
+      const sign = d.deltaLamports > 0 ? '+' : '';
+      parts.push(`• <a href="${addrLink(d.address)}">${d.address.slice(0,4)}…${d.address.slice(-4)}</a>: ${sign}${lamportsToSOL(d.deltaLamports)} SOL`);
     }
-
-    if (CHANNEL_ID) {
-      await bot.sendMessage(CHANNEL_ID, parts.join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
-    } else {
-      console.log('[sol] skip send (no CHANNEL_ID):', signature);
+  } else {
+    parts.push('\nℹ️ Адрес(а) упомянут(ы) в транзакции (возможно SPL):');
+    for (const m of mentionPubkeys) {
+      const a = m.toBase58();
+      parts.push(`• <a href="${addrLink(a)}">${a.slice(0,4)}…${a.slice(-4)}</a>`);
     }
-  } catch (e) {
-    console.error('[sol] handleSignature error:', e);
+  }
+
+  if (CHANNEL_ID) {
+    await bot.sendMessage(CHANNEL_ID, parts.join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
+  } else {
+    console.log('[sol] skip send (no CHANNEL_ID):', signature);
   }
 }
 
@@ -334,6 +305,7 @@ function assertAdmin(msg) {
   if (ADMIN_CHAT_IDS.length === 0) return true;
   return ADMIN_CHAT_IDS.includes(String(msg.chat.id));
 }
+
 bot.onText(/^\/status$/, async (msg) => {
   const watched = await getWatchedAddresses();
   const lines = [];
@@ -355,7 +327,6 @@ bot.onText(/^\/list$/, async (msg) => {
 bot.onText(/^\/redis$/, async (msg) => {
   if (!redis) return bot.sendMessage(msg.chat.id, 'Redis: отключён (нет конфигурации).');
   try {
-    // покажем DNS хоста для диагностики
     const host = new URL(process.env.REDIS_URL).hostname;
     const a = await dns.lookup(host, { all: true });
     const pong = await redis.ping();
