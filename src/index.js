@@ -70,7 +70,7 @@ if (redis) {
 const connection = new Connection(HTTPS_RPC, { wsEndpoint: WSS_RPC, commitment: 'confirmed' });
 
 // ====== Helpers ======
-const WATCH_SET_KEY = 'watch:addresses';
+const WATCH_SET_KEY    = 'watch:addresses';
 const WATCH_LABELS_KEY = 'watch:labels'; // HSET: address -> label
 
 const seenSignatures = new Set();
@@ -314,7 +314,8 @@ async function handleSignature(signature, mentionPubkeys) {
   if (deltas.length) {
     lines.push('\n📈 Изменение баланса:');
     for (const d of deltas) {
-      const label = (await getLabel(d.address)) || shortAddr(d.address);
+      const plainLabel = (await getLabel(d.address)) || shortAddr(d.address);
+      const labelLink = `<a href="${addrLink(d.address)}">${plainLabel}</a>`;
       const deltaSOL = lamportsToSOL(d.deltaLamports);
       const usdChange = price ? deltaSOL * price : 0;
 
@@ -327,7 +328,7 @@ async function handleSignature(signature, mentionPubkeys) {
       } catch {}
 
       const sign = deltaSOL > 0 ? '+' : '';
-      lines.push(`• ${label}: ${sign}${deltaSOL.toFixed(6)} SOL ${price ? fmtUSD(usdChange) : ''}`);
+      lines.push(`• ${labelLink}: ${sign}${deltaSOL.toFixed(6)} SOL ${price ? fmtUSD(usdChange) : ''}`);
       if (balSOL != null) {
         lines.push(`  Текущий баланс: ${balSOL.toFixed(6)} SOL ${usdBal != null ? fmtUSD(usdBal) : ''}`);
       }
@@ -336,8 +337,9 @@ async function handleSignature(signature, mentionPubkeys) {
     lines.push('\nℹ️ Адрес(а) упомянут(ы) в транзакции:');
     for (const m of mentionPubkeys) {
       const a = m.toBase58();
-      const label = (await getLabel(a)) || shortAddr(a);
-      lines.push(`• ${label} <a href="${addrLink(a)}">(${shortAddr(a)})</a>`);
+      const plainLabel = (await getLabel(a)) || shortAddr(a);
+      const labelLink = `<a href="${addrLink(a)}">${plainLabel}</a>`;
+      lines.push(`• ${labelLink} <code>(${shortAddr(a)})</code>`);
     }
   }
 
