@@ -384,10 +384,15 @@ bot.onText(/^\/list$/, async (msg) => {
 bot.onText(/^\/redis$/, async (msg) => {
   if (!redis) return bot.sendMessage(msg.chat.id, 'Redis: отключён (нет конфигурации).');
   try {
-    const host = new URL(process.env.REDIS_URL).hostname;
-    const a = await dns.lookup(host, { all: true });
+    const opts = redis.options || {};
+    const host = opts.host || (opts.connectionOptions && opts.connectionOptions.host);
+    const port = opts.port || (opts.connectionOptions && opts.connectionOptions.port);
+    const isTLS = !!(opts.tls || (opts.connectionOptions && opts.connectionOptions.tls));
     const pong = await redis.ping();
-    await bot.sendMessage(msg.chat.id, `Redis OK: ${pong}\nDNS ${host}:\n` + a.map(r=>`${r.address} (${r.family})`).join('\n'));
+    await bot.sendMessage(
+      msg.chat.id,
+      `Redis OK: ${pong}\nHost: ${host}:${port}\nTLS: ${isTLS ? 'on' : 'off'}`
+    );
   } catch (e) {
     await bot.sendMessage(msg.chat.id, `Redis error: ${e?.message || e}`);
   }
