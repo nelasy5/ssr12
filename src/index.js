@@ -34,36 +34,59 @@ bot.onText(/^\/start$/, (m) => bot.sendMessage(m.chat.id, 'Я на связи. �
 bot.onText(/^\/ping$/,  (m) => bot.sendMessage(m.chat.id, 'pong'));
 bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
 
-// ====== REDIS (auto TLS / public / private) ======
-function makeRedis() {
-  const url = process.env.REDIS_URL;
-  const opts = {
+/* ======================================================================
+   REDIS (Private с авто‑фоллбеком на Public TLS)
+   ====================================================================== */
+
+function createRedisClientFromUrl(url) {
+  const useTLS = url.startsWith('rediss://');
+  return new Redis(url, {
     lazyConnect: true,
     maxRetriesPerRequest: null,
     enableReadyCheck: true,
-    reconnectOnError: () => true
-  };
-  if (url) {
-    const useTLS = url.startsWith('rediss://');
-    return new Redis(url, { ...opts, tls: useTLS ? {} : undefined });
-  }
-  const host = process.env.REDIS_HOST;
-  const port = Number(process.env.REDIS_PORT || 6379);
-  const password = process.env.REDIS_PASSWORD || undefined;
-  const useTLS = process.env.REDIS_TLS === '1';
-  if (!host) {
+    reconnectOnError: () => true,
+    tls: useTLS ? {} : undefined,
+  });
+}
+
+async function makeRedis() {
+  const privateUrl = process.env.REDIS_URL;         // reference на Redis-bFBw.REDIS_URL
+  const publicUrl  = process.env.REDIS_URL_PUBLIC;  // rediss://…proxy.rlwy.net:PORT (TLS)
+
+  // если приватки нет — сразу public (если задан)
+  if (!privateUrl) {
+    if (publicUrl) {
+      console.warn('[redis] REDIS_URL не задан. Используем public URL (TLS).');
+      return createRedisClientFromUrl(publicUrl);
+    }
     console.warn('[redis] REDIS_URL/REDIS_HOST не заданы — персистентность отключена.');
     return null;
   }
-  return new Redis({ host, port, password, tls: useTLS ? {} : undefined, ...opts });
+
+  // пробуем приватку; если DNS недоступен — fallback на public
+  try {
+    const host = new URL(privateUrl).hostname;
+    await dns.lookup(host); // быстрый DNS‑чек, чтобы не ждать таймаутов ioredis
+    console.log('[redis] using private URL:', host);
+    return createRedisClientFromUrl(privateUrl);
+  } catch (e) {
+    console.warn('[redis] private DNS check failed, fallback to public if available:', e?.message || e);
+    if (publicUrl) {
+      console.log('[redis] using public TLS URL');
+      return createRedisClientFromUrl(publicUrl);
+    }
+    console.warn('[redis] public URL not set — Redis будет отключён.');
+    return null;
+  }
 }
-const redis = makeRedis();
+
+const redis = await makeRedis();
 if (redis) {
   redis.on('error', (e) => console.error('[redis] error:', e?.message || e));
   redis.on('connect', () => console.log('[redis] connected'));
   redis.on('ready', () => console.log('[redis] ready'));
   redis.on('end', () => console.warn('[redis] disconnected'));
-  redis.connect().catch((e) => console.error('[redis] connect failed:', e?.message || e));
+  try { await redis.connect(); } catch (e) { console.error('[redis] connect failed:', e?.message || e); }
 }
 
 // ====== SOLANA CONNECTION ======
@@ -381,6 +404,7 @@ bot.onText(/^\/list$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `Сейчас отслеживаю:\n${rows.join('\n')}`, { parse_mode: 'HTML' });
 });
 
+// /redis — показать фактическое подключение
 bot.onText(/^\/redis$/, async (msg) => {
   if (!redis) return bot.sendMessage(msg.chat.id, 'Redis: отключён (нет конфигурации).');
   try {
