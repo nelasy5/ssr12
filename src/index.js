@@ -3,7 +3,7 @@ import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
 import Redis from 'ioredis';
-import dns from 'node:dns/promises';
+import { lookup as dnsLookup } from 'node:dns/promises';
 
 // ====== ENV ======
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -43,7 +43,7 @@ bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
    ====================================================================== */
 
 
-import dns from 'node:dns/promises';
+
 
 function urlFromParts() {
   const host = process.env.REDISHOST || process.env.REDIS_HOST;
@@ -73,7 +73,7 @@ async function tryConnect(url, label) {
     // быстрый DNS-чек (не критично, просто ускоряет провал)
     try {
       const host = new URL(url).hostname;
-      await dns.lookup(host);
+      await dnsLookup(host);
     } catch (_) {}
     await client.connect();
     const pong = await client.ping();
