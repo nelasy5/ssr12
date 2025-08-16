@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
-import { RedisService } from "./RedisService.js";
+import Redis from 'ioredis';
 import dns from 'node:dns/promises';
 
 // ====== ENV ======
@@ -35,9 +35,117 @@ bot.onText(/^\/ping$/,  (m) => bot.sendMessage(m.chat.id, 'pong'));
 bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
 
 /* ======================================================================
-   REDIS (Private с авто‑фоллбеком на Public TLS)
+   REDIS (совместимо с твоим "рабочим" проектом + fallback на Public)
+   Поддерживает переменные:
+   - REDISHOST / REDISPORT / REDISUSER / REDISPASSWORD
+   - REDIS_URL (private)
+   - REDIS_PUBLIC_URL (public, proxy)
    ====================================================================== */
 
+import Redis from 'ioredis';
+import dns from 'node:dns/promises';
+
+function urlFromParts() {
+  const host = process.env.REDISHOST || process.env.REDIS_HOST;
+  const port = process.env.REDISPORT || process.env.REDIS_PORT || '6379';
+  const user = process.env.REDISUSER || process.env.REDIS_USER || 'default';
+  const pass = process.env.REDISPASSWORD || process.env.REDIS_PASSWORD;
+  if (!host || !pass) return null;
+  // важное: оставляем явный "redis://" (без TLS) — как в рабочем проекте
+  return `redis://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+}
+
+function buildClient(url) {
+  const useTLS = url.startsWith('rediss://');
+  return new Redis(url, {
+    lazyConnect: true,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: true,
+    reconnectOnError: () => true,
+    tls: useTLS ? {} : undefined,
+  });
+}
+
+async function tryConnect(url, label) {
+  const client = buildClient(url);
+  client.on('error', (e) => console.error(`[redis:${label}]`, e?.message || e));
+  try {
+    // быстрый DNS-чек (не критично, просто ускоряет провал)
+    try {
+      const host = new URL(url).hostname;
+      await dns.lookup(host);
+    } catch (_) {}
+    await client.connect();
+    const pong = await client.ping();
+    console.log(`[redis:${label}] connected, ping=${pong}`);
+    return client;
+  } catch (e) {
+    try { client.disconnect(); } catch {}
+    throw e;
+  }
+}
+
+async function makeRedis() {
+  // 1) Пытаемся собрать private URL из раздельных переменных,
+  //    чтобы форсировать host = redis.railway.internal (как в рабочем проекте)
+  let privateUrl = urlFromParts();
+
+  // 2) Если раздельных нет — используем REDIS_URL как есть
+  if (!privateUrl && process.env.REDIS_URL) privateUrl = process.env.REDIS_URL;
+
+  const publicUrl = process.env.REDIS_PUBLIC_URL; // можно оставить пустым, если приватка ок
+
+  if (privateUrl) {
+    const host = new URL(privateUrl).hostname;
+    console.log('[redis] try PRIVATE:', host);
+    try {
+      const c = await tryConnect(privateUrl, 'private');
+      console.log('[redis] using PRIVATE URL:', host);
+      return c;
+    } catch (e) {
+      console.warn('[redis] private connect failed:', e?.message || e);
+      if (!publicUrl) {
+        console.warn('[redis] public URL not set — Redis будет отключён');
+        return null;
+      }
+      console.log('[redis] fallback to PUBLIC…');
+      return await tryConnect(publicUrl, 'public');
+    }
+  }
+
+  if (publicUrl) {
+    console.log('[redis] no private URL, using PUBLIC…');
+    return await tryConnect(publicUrl, 'public');
+  }
+
+  console.warn('[redis] нет REDIS_URL/REDISHOST/REDIS_PUBLIC_URL — персистентность отключена');
+  return null;
+}
+
+const redis = await makeRedis();
+
+if (redis) {
+  redis.on('ready', () => console.log('[redis] ready'));
+  redis.on('end', () => console.warn('[redis] disconnected'));
+}
+
+// /redis — показать реальное подключение (оставь как у тебя)
+bot.onText(/^\/redis$/, async (msg) => {
+  if (!redis) return bot.sendMessage(msg.chat.id, 'Redis: отключён (нет конфигурации).');
+  try {
+    const opts = redis.options || {};
+    const host = opts.host || opts.connectionOptions?.host;
+    const port = opts.port || opts.connectionOptions?.port;
+    const isTLS = !!(opts.tls || opts.connectionOptions?.tls);
+    const pong = await redis.ping();
+    await bot.sendMessage(
+      msg.chat.id,
+      `Redis OK: ${pong}\nHost: ${host}:${port}\nTLS: ${isTLS ? 'on' : 'off'}`
+    );
+  } catch (e) {
+    await bot.sendMessage(msg.chat.id, `Redis error: ${e?.message || e}`);
+  }
+});
 
 // ====== SOLANA CONNECTION ======
 const connection = new Connection(HTTPS_RPC, { wsEndpoint: WSS_RPC, commitment: 'confirmed' });
