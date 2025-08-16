@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
-import Redis from 'ioredis';
+import { RedisService } from "./RedisService";
 import dns from 'node:dns/promises';
 
 // ====== ENV ======
@@ -38,82 +38,6 @@ bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
    REDIS (Private с авто‑фоллбеком на Public TLS)
    ====================================================================== */
 
-function buildClient(url) {
-  const useTLS = url.startsWith('rediss://');
-  return new Redis(url, {
-    lazyConnect: true,
-    maxRetriesPerRequest: null,
-    enableReadyCheck: true,
-    reconnectOnError: () => true,
-    tls: useTLS ? {} : undefined,
-  });
-}
-
-// Пытаемся реально подключиться и сделать PING.
-// Если не удалось — кидаем исключение (чтобы перейти на fallback).
-async function tryConnect(url, label) {
-  const client = buildClient(url);
-  client.on('error', (e) => console.error(`[redis:${label}] error:`, e?.message || e));
-
-  try {
-    // быстрый DNS‑чек (не строгий, просто сократит бессмысленные ретраи)
-    try {
-      const host = new URL(url).hostname;
-      await dns.lookup(host);
-    } catch (e) {
-      console.warn(`[redis:${label}] DNS lookup failed:`, e?.message || e);
-    }
-
-    await client.connect();          // установим TCP
-    const pong = await client.ping();// и проверим команду
-    console.log(`[redis:${label}] connected, ping=${pong}`);
-    return client;                   // готовый подключенный клиент
-  } catch (e) {
-    try { client.disconnect(); } catch {}
-    throw e;
-  }
-}
-
-async function makeRedis() {
-  const privateUrl = process.env.REDIS_URL;         // reference на Redis-bFBw.REDIS_URL
-  const publicUrl  = process.env.REDIS_URL_PUBLIC;  // rediss://…proxy.rlwy.net:PORT (TLS)
-
-  // 1) Пытаемся Private: если не вышло — падаем в Public (если задан)
-  if (privateUrl) {
-    const host = new URL(privateUrl).hostname;
-    console.log('[redis] trying private:', host);
-    try {
-      const c = await tryConnect(privateUrl, 'private');
-      console.log('[redis] using PRIVATE URL:', host);
-      return c;
-    } catch (e) {
-      console.warn('[redis] private connect failed:', e?.message || e);
-      if (!publicUrl) {
-        console.warn('[redis] public URL not set — Redis будет отключён.');
-        return null;
-      }
-      console.log('[redis] falling back to PUBLIC TLS…');
-      return await tryConnect(publicUrl, 'public');
-    }
-  }
-
-  // 2) Приватки нет — если задан, идём в Public
-  if (publicUrl) {
-    console.log('[redis] no private URL, using PUBLIC TLS…');
-    return await tryConnect(publicUrl, 'public');
-  }
-
-  console.warn('[redis] REDIS_URL/REDIS_URL_PUBLIC не заданы — персистентность отключена.');
-  return null;
-}
-
-const redis = await makeRedis();
-
-if (redis) {
-  // Дополнительные статусы (после успешного connect/ready)
-  redis.on('ready', () => console.log('[redis] ready'));
-  redis.on('end', () => console.warn('[redis] disconnected'));
-}
 
 // ====== SOLANA CONNECTION ======
 const connection = new Connection(HTTPS_RPC, { wsEndpoint: WSS_RPC, commitment: 'confirmed' });
