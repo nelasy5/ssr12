@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
-import { RedisService } from "./RedisService";
+import { RedisService } from "./RedisService.js";
 import dns from 'node:dns/promises';
 
 // ====== ENV ======
