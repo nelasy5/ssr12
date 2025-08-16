@@ -11,8 +11,8 @@
   "dependencies": {
     "@solana/web3.js": "^1.95.3",
     "dotenv": "^16.4.5",
-    "ioredis": "^5.4.1",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "redis": "^4.7.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
