@@ -42,7 +42,7 @@ bot.on('message', (m) => console.log('[tg] incoming', m.chat.id, m.text));
    - REDIS_PUBLIC_URL (public, proxy)
    ====================================================================== */
 
-import Redis from 'ioredis';
+
 import dns from 'node:dns/promises';
 
 function urlFromParts() {
